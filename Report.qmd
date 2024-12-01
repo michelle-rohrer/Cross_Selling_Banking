@@ -1,0 +1,545 @@
+---
+title: "Schlaftrackeranalyse"
+author: "Sabina Grüner und Michelle Rohrer"
+format: revealjs
+editor: visual
+---
+
+# Einführung
+
+In der Gruppenarbeit haben wir uns mit einer Schlaftrackeranalyse befasst. Wir haben die Herzfrequenz in Verbindung mit der Schlafzeit untersucht um mögliche Anomalien festzustellen.
+
+Ein within subject Vergleich wurde nicht durchgeführt, da nur Aufzeichnungen des Schlafes vorhanden sind und somit kein Vergleich der Herzrate über den Tag mit der vorhandenen über Nacht möglich ist.
+
+# Data Wrangling
+
+## Notwendige Pakete laden
+
+```{r, echo=TRUE}
+library(tidyverse)
+library(tidymodels)
+library(lubridate)
+library(recipes)
+library(LiblineaR)
+library(randomForest)
+library(renv)
+```
+
+## Dataset laden
+
+Unser Dataset besteht aus 8375 Observationen, wo jede Beobachtung eine Schlafphase darstellt über einen Zeitraum von insgesamt etwa 9 Monaten. Ausserdem haben wir die Start- und Endzeit der jeweiligen Schlafphasen, sowie die Herzrate und wann die Herzrate gemessen wurde.
+
+Des Weiteren sind die Schlafphasen bereits nach Kategorie (Qualitativ) gelabelt weshalb ein vorheriges labeln, welches beim supervised Machine learning benötigt wird, entfällt. Um eine realistische Bewertung des Modells zu erhalten werden die labels im Verlauf der Arbeit aus den Testdaten entfernt und bleiben somit lediglich in den Trainingsdaten vorhanden.
+
+```{r, echo=TRUE}
+df <- read.csv("Data/sleep_data.csv")
+```
+
+## Dataset bearbeiten
+
+Zeilen mit fehlenden Werten oder einer "Unspecified" Kategorie werden entfernt.
+
+Die Titel der Spalten werden umformatiert.
+
+Ein brauchbares Datumsformat wird eingeführt. yyyy-mm-dd hh-mm-ss
+
+```{r, echo=TRUE}
+# Check for missing values
+print("missing values:" %>% paste(sum(is.na(df))))
+
+# Delete column "Source.Name"
+df <- subset(df, select = -Source.Name)
+
+# Rename columns
+df <- df %>% rename(category = Category) # done
+df <- df %>% rename(heart_rate = Heart.Rate) # done
+
+# filter out "Awake" categories. Convert time information into usable date format and add new date Columns (start, end)
+df <- df %>% 
+  filter(category != "Awake") %>% 
+  mutate(start = as_datetime(Start.Time)) %>% 
+  mutate(end = as_datetime(End.Time))
+
+# Filtering necessary columns (deleting Timestamp, Start.Time, End.Time)
+df <- df %>% 
+  select(start, end, category, heart_rate)
+
+# Calculate time difference and add new column "duration" in [sec]
+df<- df %>% 
+  mutate(duration = end - start )
+
+# Delete row with "Unspecified" category
+df <- df[df$category != "Unspecified", ]
+
+# Type change of column "duration" (time > dbl)
+df$duration <- as.numeric(df$duration)
+```
+
+Um eine sinnvolle Bewertung des Schlafes beziehungsweise der Schlafphasen durchführen zu können, werden die gegebenen Daten anhand des Datums beziehungsweise anhand der Uhrzeit in einzelne Schlafzyklen unterteilt und gruppiert. Dabei wird davon ausgegangen, dass eine zeitliche Differenz von mehr als 5 Stunden zwischen zwei einzelnen Beobachtungen als Wachphase angenommen werden kann.
+
+Die Spalte "cycle" gibt hierbei zusammengehörigen Schlafzyklen eine eindeutige Nummerierung.
+
+Die Spalte "cycle_id" nummeriert die abwechselnden Schlafphasen innerhalb eines Zyklus. Dies wird benötigt um dem Modell eine bessere Möglichkeit zu geben ein vorhandenes Zyklusmuster über alle Schlafphasen aller Tage zu erkennen. Hierbei wird auch schnell ersichtlich, dass jeder Schlafzyklus mit einer "Light/Core" Phase beginnt, da eine Person im Normalfall nicht direkt in Tiefschlaf verfällt.
+
+```{r, echo=TRUE}
+# Grouping sleep times per cycle
+
+# Determine when new sleep cycle begins (e.g. if time difference is > 5 hours)
+# Add column "time_diff" = time difference between consecutive rows
+# Add column "cycle" = determines when new sleep cycle starts
+# Add column "cycle_id" = numbered individual cycle
+df_sleep_per_unit <- df %>%
+  mutate(time_diff = as.numeric(difftime(end, lag(start), units = "secs")),
+         time_diff = ifelse(is.na(time_diff), 1, time_diff)) %>%
+  mutate(cycle = ifelse(time_diff > 5 * 60 * 60 | time_diff == 1, 1, 0), cycle = cumsum(cycle)) %>%
+  group_by(cycle) %>%
+  mutate(cycle_id = row_number() / 100)
+
+
+```
+
+Im Anschluss wird die Gesamtzeit des Schlafes sowie der einzelnen Schlafphasen (nach Kategorie) berechnet um den Prozentsatz der jeweilige Schlafphase in gegebenem Schlafzyklus berechnen zu können.
+
+```{r, echo=TRUE}
+# Summation of total sleep time per cycle (based on first start.time and last end.time (difference))
+df_sum_cycle <- df_sleep_per_unit %>%
+  group_by(cycle) %>%
+  summarize(total_sleep_time = as.numeric(difftime(max(end), min(start), units = "secs")))
+
+# Summary time per cycle per category and add new column "percentage"
+df_sum_cat <- merge(df_sleep_per_unit, df_sum_cycle, by = "cycle", all = TRUE) %>%
+  group_by(cycle, category, total_sleep_time) %>%
+  summarize(total_category_time = sum(duration, na.rm = TRUE)) %>%
+  mutate(percentage = total_category_time / total_sleep_time * 100)
+```
+
+```{r, echo=TRUE}
+# Replace 0 for first value in column "time_diff" with value 1 (Error occurred with value 0)
+df_sleep_per_unit$time_diff <- replace(df_sleep_per_unit$time_diff, 0, 1)
+```
+
+## Datenset Einblick
+
+In der Graphik wird die Herzfrequenz während des Schlafes der Person aufgeteilt in Monate dargestellt, um einen kurzen Überblick zu bekommen. Das Schlafmuster sieht überwiegend gleichmässig aus. Die Ausreisser können auf intensive Träume hindeuten. Die abweichende Dichte der Diagramme von Mai 2023 und September 2022 sind darauf zurückzuführen, dass die Aufzeichnungen in der jeweiligen Monatsmitte beginnen, beziehungsweise enden.
+
+Um die Ausreisser genauer zu untersuchen und die Schlafqualität zu klassifizieren werden wir verschiedene Machine Learning Methoden anwenden.
+
+```{r, echo=TRUE}
+# short insight
+head(df)
+
+# Visualization
+df %>%
+  ggplot(aes(x = start, y = heart_rate, color = category)) +
+  geom_line() +
+  facet_wrap(~ format(start, "%B %Y"), scales = "free_x") +
+  labs(title = "Herzfrequenz über Monate", x = "Zeit", y = "Herzfrequenz") +
+  theme_minimal()
+```
+
+# Machine learning
+
+## Qualitätsbewertung
+
+Hierbei werden die errechneten Prozentsätze der einzelnen Schlafphasen mit den üblich bekannten Grenzwerten, welche weiter unten ausführlich angegeben werden, verglichen um die Qualität zu bewerten.
+
+### Splitten der Daten Training (70%) Test (30%)
+
+Vor Beginn des Modelltrainings werden die Daten in Trainings (70%) und Testdaten (30%) unterteilt. Wobei hier wie oben bereits erwähnt, der Datensatz in ganzen Zyklen aufgeteilt wird um ein sinnvolles Ergebnis über einen Tag beziehungsweise eine Nacht zu erhalten.
+
+```{r, echo=TRUE}
+# Split training and test data by sleep cycles (~70/30%)
+
+# Create a new column indicating start of new cycle
+df_sleep_per_unit$start_of_cycle <- c(0, diff(df_sleep_per_unit$cycle) != 0)
+
+# Identify the rows where new cycle starts
+cycle_starts <- which(df_sleep_per_unit$start_of_cycle == TRUE)
+
+# Calculate index for the split (for split data after whole cycles ~ 70%)
+split_index <- round(0.7 * length(cycle_starts))
+
+# Create training set (first 70% of cycles)
+training_cycles <- cycle_starts[1:split_index]
+df_SPU_training <- df_sleep_per_unit[df_sleep_per_unit$cycle %in% df_sleep_per_unit$cycle[training_cycles], ]
+
+# Create test set (remaining 30% of cycles)
+test_cycles <- cycle_starts[(split_index + 1):length(cycle_starts)]
+df_SPU_test <- df_sleep_per_unit[df_sleep_per_unit$cycle %in% df_sleep_per_unit$cycle[test_cycles], ]
+```
+
+Bevor die bereits vorhandenen Kategorisierung der Schlafphase aus den Testdaten entfernt wird, wird eine Kopie erstellt um im Anschluss aus den vorhergesagten Werte die Genauigkeit berechnen zu können.
+
+```{r, echo=TRUE}
+# Copy of df_SPU_test with column "category" for validation of accuracy
+df_SPU_acc_test <- df_SPU_test
+
+# Delete column "category" in test data (for prediction)
+# not necessary if data is not labeled and training data is labeled by hand
+df_SPU_test$category <- ""
+
+df_SPU_test$category <- as.factor(df_SPU_test$category)
+df_SPU_training$category <- as.factor(df_SPU_training$category)
+
+# Delete columns "start_of_cycle"
+df_SPU_training <- subset(df_SPU_training, select = -start_of_cycle)
+df_SPU_test <- subset(df_SPU_test, select = -start_of_cycle)
+```
+
+### Modell mit RandomForest
+
+Das vorher aufbereitete Datenset "df_SPU_training" wird nun in das Modell integriert mit einer Recipe Funktion wobei mit "category ~ ." die Kategorie durch alle vorhandenen Attribute vorhergesagt werden soll.
+
+```{r, echo=TRUE}
+head(df_SPU_training)
+```
+
+```{r, echo=TRUE}
+# Test Training Model 1 with randomForest
+
+# Define recipe
+sleep_recipe <- 
+  recipe(category ~ ., 
+         data = df_SPU_training)
+
+# Define model
+rf_model <- 
+  rand_forest() %>%          
+  set_engine("randomForest") %>%   
+  set_mode("classification")  
+
+# Define workflow
+sleep_workflow <- 
+  workflow() %>%             
+  add_model(rf_model) %>%    
+  add_recipe(sleep_recipe)
+
+# Fit model on the specified data
+sleep_fit <- fit(sleep_workflow, data = df_SPU_training)
+
+# Assess fit for acc validation training data on model
+sleep_fitted <- predict(sleep_fit, df_SPU_training) %>%
+  bind_cols(df_SPU_training %>% select(category)) 
+
+# Obtain performance metrics for training data
+metrics(sleep_fitted, truth = category, estimate = .pred_class)
+
+```
+
+Bewertung der Leistung des Modells auf Trainingsdaten:
+
+Accuracy (Genauigkeit): Gibt an wie viele der vorhergesagten Daten korrekt sind im Verhältnis zur Gesamtanzahl der Vorhersagen. Dieser Wert reicht von 0 bis 1, wobei 1 für 100% Genauigkeit steht, welche zu erwarten war.
+
+Kappa Score: Misst die Übereinstimmung der tatsächlichen und vorhergesagten Daten. Da es sich bei gegebenem Datensatz um einen "sauberen" ohne massgebende Unstimmigkeiten , handelt liegt dieser ebenfalls bei dem Wert 1, welcher für Perfekt steht (Skala ist 1, 0, -1)
+
+```{r, echo=TRUE}
+# Prediction Performance; Filling column "category" with predicted values
+pred_SPU <- predict(sleep_fit, new_data = df_SPU_test)
+df_SPU_test$category <- pred_SPU$.pred_class
+
+# Obtain performance metrics for test data
+accuracy_score <- sum(df_SPU_acc_test$category == df_SPU_test$category) / nrow(df_SPU_acc_test)
+print("accuracy score: " %>% paste(accuracy_score))
+
+```
+
+Im Anschluss wurde selbige Leistungsbewertung für die vorhergesagten Testdaten durchgeführt, wobei hier lediglich eine Genauigkeit von etwa 60% erreicht werden konnte. Dies ist zurückzuführen auf zu wenige verschiedene Merkmale im Datensatz welche ausschlaggebend sind um die Schlafphasen zu unterscheiden. Und zu ähnliche Werte der Herzfrequenz. Die Herzfrequenz Grenzen zur Beurteilung der Schlafphase überschneiden teilweise sogar.
+
+Da bereits ein ausreichend grosser Datensatz verwendet wurde könnte dies überwiegend ausschliesslich durch ein Set mit eindeutigeren Merkmalen behoben werden.
+
+### Modell mit Support Vector Machine
+
+Es wurde ein zweites Modell erstellt um den Genauigkeitswert zu vergleichen, wobei schnell ersichtlich wurde, dass die Leistung des RandomForest Modells überwiegt, weshalb dieses für die weitere Arbeit verwendet wurde.
+
+```{r, echo=TRUE}
+# Test Training Model 2 with SVM
+
+# Copy df for second model (svm); Df for second model starts with svm for quick search
+svm_df_SPU_test <- df_SPU_test
+
+# Define recipe
+svm_sleep_recipe <- 
+  recipe(category ~ cycle_id + duration + heart_rate,
+         data = df_SPU_training)
+
+# Define model 
+svm_model <- 
+  svm_linear() %>%          
+  set_engine("LiblineaR") %>%    
+  set_mode("classification")  
+
+# Define workflow 
+svm_sleep_workflow <- 
+  workflow() %>%             
+  add_model(svm_model) %>%    
+  add_recipe(svm_sleep_recipe)
+
+# Fit model on specified data
+svm_sleep_fit <- fit(svm_sleep_workflow, data = df_SPU_training)
+
+# Assess fit
+svm_sleep_fitted <- predict(svm_sleep_fit, df_SPU_training) %>%
+  bind_cols(df_SPU_training %>% select(category)) 
+
+# Obtain performance metrics for training data
+metrics(svm_sleep_fitted, truth = category, estimate = .pred_class)
+
+# Prediction Performance 
+svm_pred_SPU <- predict(svm_sleep_fit, new_data = df_SPU_test)
+
+# Insert predicted values in category
+svm_df_SPU_test$category <- svm_pred_SPU$.pred_class
+
+# Obtain performance metrics for test data
+svm_accuracy_score <- sum(df_SPU_acc_test$category == svm_df_SPU_test$category) / nrow(df_SPU_acc_test)
+print("accuracy score: " %>% paste(svm_accuracy_score))
+```
+
+### Ergebnis
+
+Im Anschluss eine Grafik, welche den Schlafzyklus eingeteilt in Kategorien über einen beliebigen Tag darstellt. Hierbei kann nochmals visuell zwischen Trainingsdaten und Testdaten verglichen werden, wobei man ebenfalls sieht, dass aufgrund fehlender Genauigkeit die Grafiken abweichen.
+
+```{r, echo=TRUE}
+# Visualization function
+sleep_phases <- function(frame, day){
+  filtered_data <- frame %>% 
+   filter(day == cycle)
+ 
+# Visualization
+  ggplot(filtered_data, aes(x = start, xend = end, y = category, yend = category)) + 
+  geom_segment(size = 3, color = "blue") +
+   labs(x = "Zeit", y = "Schlafphasen") +
+   ggtitle("Schlafphasen eines Schlafzyklus") +
+   theme_minimal()
+ }
+
+# Original values
+sleep_phases(df_sleep_per_unit, 177)
+
+# Predicted values (days start from 171)
+sleep_phases(df_SPU_test, 177)
+```
+
+Es wird nochmals der prozentuale Anteil jeder Schlafphase an der Gesamtschlafzeit errechnet, nur diesmal mit den vorhergesagten Werten.
+
+```{r, echo=TRUE}
+# Summary of total bed time per cycle (based on first start.time and last end.time respectively difference)
+df_pred_sum_cycle <- df_SPU_test %>%
+  group_by(cycle) %>%
+  summarize(total_sleep_time = as.numeric(difftime(max(end), min(start), units = "secs")))
+
+# Summary time per cycle per category
+df_pred_sum_cat <- merge(df_SPU_test, df_pred_sum_cycle, by = "cycle", all = TRUE) %>%
+  group_by(cycle, category, total_sleep_time) %>%
+  summarize(total_category_time = sum(duration, na.rm = TRUE)) %>%
+  mutate(percentage = total_category_time / total_sleep_time * 100)
+
+glimpse(df_pred_sum_cat)
+```
+
+Zu Ende hin werden die Schlafphasen qualitativ (Pro Kategorie, sowie Gesamtschlafdauer) bewertet mit nachfolgenden üblichen Grenzen für den Schlaf einer standard Person:
+
+Notes for valuation:
+
+Alles in diesen Grenzen deutet auf einen guten Schlaf hin
+
+zu wenig 20% \< REM \< 25% zu viel
+
+zu wenig 15% \< Deep \< 30% zu viel
+
+zu wenig 50% \< Light/core \< 60% zu viel
+
+zu wenig 7h \< Sleep_time \< 9h
+
+```{r, echo=TRUE}
+# Valuation function sleep phases
+evaluate_sleep <- function(row) {
+  if (row$category == "REM" && row$percentage < 20) {
+    return("zu wenig REM")
+  } else if (row$category == "REM" && row$percentage > 25) {
+    return("zu viel REM")
+  } else if (row$category == "Deep" && row$percentage < 15) {
+    return("zu wenig Deep")
+  } else if (row$category == "Deep" && row$percentage > 30) {
+    return("zu viel Deep")
+  } else if ((row$category == "Light/Core") && row$percentage < 50) {
+    return("zu wenig Light/Core")
+  } else if ((row$category == "Light/Core") && row$percentage > 60) {
+    return("zu viel Light/Core")
+  } else {
+    return("Optimal")
+  }
+}
+
+# Create new column for predicted data - valuation
+df_pred_sum_cat$rating_sleep <- apply(df_pred_sum_cat, 1, function(row) evaluate_sleep(as.data.frame(t(row))))
+
+# Create new column for original data - valuation
+df_sum_cat$rating_sleep <- apply(df_sum_cat, 1, function(row) evaluate_sleep(as.data.frame(t(row))))
+```
+
+```{r, echo=TRUE}
+# Valuation function sleep time
+evaluate_time <- function(row) {
+  if(row$total_sleep_time < 7 * 60 * 60){
+    return("zu wenig schlaf")
+  } else if(row$total_sleep_time > 9 * 60 * 60){
+    return("zu viel schlaf")
+  } else {
+    return("Optimale schlafzeit")
+  }
+}
+
+# Create new column for predicted data - valuation
+df_pred_sum_cat$rating_time <- apply(df_pred_sum_cat, 1, function(row) evaluate_time(as.data.frame(t(row))))
+
+# Create new column for original data - valuation
+df_sum_cat$rating_time <- apply(df_sum_cat, 1, function(row) evaluate_time(as.data.frame(t(row))))
+
+head(df_pred_sum_cat)
+head(df_sum_cat)
+```
+
+Auch hier kann wieder zwischen den bereits gelabelten Daten im Trainingsdatenset und den vorhergesagten Werten im Testdatenset unterschieden werden, wobei hier ebenfalls die Ungenauigkeit heraussticht.
+
+Grundsätzlich lässt sich aber feststellen, dass es sich bei dieser Person um einen Leichtschläfer handelt, da nicht nur der prozentuale Anteil der Tiefschlafphase nahe an der unteren Grenze liegt sondern auch der Anteil der ebenso wichtigen REM Phase. Diese Feststellung deckt sich auch mit der Beobachtung, dass diese Person relativ viele Aufwachphase aufweist.
+
+Ein weiterer Schritt zur genaueren Bewertung wäre nun die Analyse der Wachphasen in bezug auf Herzrate in diesem Moment, sowie Dauer und Ryhtmus, in Relation zu den restlichen Schlafphasen.
+
+## Anomalieerkennung
+
+Um die Anomalien in unseren Daten zu filtern werde ich die Daten in Cluster teilen und mithilfe der Cluster-Methode visualisieren.
+
+### Anzahl Cluster bestimmen
+
+Gemäss der Ellbogen-Methode ist die optimale Anzahl der Cluster 3, dies lässt sich auch dadurch ableiten, dass wir drei verschiedene Schlafphasen mit verschiedenen Merkmalen haben.
+
+```{r, echo=TRUE}
+# Cluster pro cycle
+df_cluster <- df_sleep_per_unit %>% 
+  mutate(cluster = case_when(
+    category == "Light/Core"  ~ 1,
+    category == "REM"  ~ 2,
+    category == "Deep"  ~ 3,
+    TRUE  ~ 0
+  ))
+  
+# Filter for numeric columns
+df_cluster <- df_cluster[, c("heart_rate", "duration", "cluster")]
+
+# Elbow-Method (Within cluster sum of square)
+wss <- numeric(10)
+for (i in 1:10) {
+  kmeans_model <- kmeans(df_cluster, centers = i)
+  wss[i] <- sum(kmeans_model$withinss)
+}
+
+plot(1:10, wss, type = "b", xlab = "Cluster Anzahl", ylab = "Innerhalb der Summe der Quadrate")
+```
+
+Note zu quadratischer Distanz: Für jeden Datenpunkt wird die quadratische Distanz zu den Zentren aller Cluster berechnet und aufsummiert. Dies wird für alle Datenpunkte durchgeführt, und Sie erhalten einen Vektor distances, der die aggregierten quadratischen Distanzen für jeden Datenpunkt enthält.
+
+Note zu Anomalie Score: Dieser Score gibt an, wie weit ein Datenpunkt von den Zentren der zugewiesenen Cluster entfernt ist. Größere Anomalie-Scores deuten darauf hin, dass ein Datenpunkt weiter von seinem Clusterzentrum entfernt ist und daher als "anomal" betrachtet werden kann.
+
+Note zu Schwellenwert: Die oberen 40% der Anomalie-Scores werden als "Anomalien" betrachtet
+
+### Manuelles Clustering
+
+In diesem Model habe ich die Cluster individuell gesetzt, da die verschiedenen Schlafphasen unterschiedliche Werte haben. So sollte sich theoretisch jede Schlafphase voneinander unterscheiden lassen.
+
+```{r, echo=TRUE}
+# Manual Clustering
+# 1. Visualization of anomalies
+
+# Calculation distance to the cluster centers
+distances <- apply(df_cluster, 1, function(x) sum((x - kmeans_model$centers[df_cluster$cluster, ])^2))
+
+# Anomaly-Score
+anomaly_scores <- sqrt(distances)
+
+# 2. Defining a threshold value
+threshold <- quantile(anomaly_scores, 0.60)
+
+# 3. Add new column "anomaly"
+df_cluster$anomaly <- anomaly_scores > threshold
+
+# Create new dataframe for only anomalies
+df_anomalies <- df_cluster[anomaly_scores > threshold, ]
+```
+
+In den Graphiken werden in blau die Anomalien unserer Daten dargestellt, dies sind die Werte, welche sich zu weit vom Cluster-Zentrum befinden. Die drei Graphiken stellen die verschiedenen Schlafphasen (1 = Light; 2 = REM; 3 = Deep) dar.
+
+Die Anomalien auf der Y-Achse sind Anomalien in der Schlafzeit, beziehungsweise die blauen Punkte zeigen uns, dass die Person in dieser Schlafphase zu lange oder zu kurz war.
+
+Auf der X-Achse haben wir die Anomalien der Herzfrequenz, beziehunsgweise die blauen Punkte zeigen uns, dass die Person in dieser Schlafphase eine zu hohenoder zu niedrige Herzfrequenz hat.
+
+Wie auch oben in der Analyse haben wir hier in der Light Phase oft zu lange Schlafphasen und die Deep-Phase ist zu kurz. Dadurch, dass der Durchschnitt der Deep-Phase unterdurchschnittlich ist, denkt unser Modell, dass die optimalen Werte bereits Anomalien darstellen.
+
+herausfinden warum dieser Punkt pink ist
+
+```{r, echo=TRUE}
+# 4. Visualization function
+clustering <- function(df_cluster, category) {
+  df_cluster <- df_cluster %>%
+    filter(cluster == category)
+
+  ggplot(df_cluster, aes(x = heart_rate, y = duration, color = anomaly, alpha = anomaly)) + 
+    geom_point() + 
+    labs(title = paste("Anomalieerkennung in der Schlafphase", category), 
+         x = "Herzrate", y = "Dauer der Schlafphase")
+}
+
+clustering(df_cluster, category = 1) 
+clustering(df_cluster, category = 2)
+clustering(df_cluster, category = 3)
+```
+
+### Automatisches Clustering
+
+Um meine Theorie zu überprüfen, ob die Schlafphasen sich so unterscheiden, dass dies auch das Modell erkennt werde ich die Cluster mithilfe des K-Means-Algorithmus generieren lassen.
+
+```{r, echo=TRUE}
+# Automatic Clustering
+# Second Model for clustering (Set cluster yourself)
+df_cluster_test <- df_sleep_per_unit[, c("heart_rate", "duration")]
+
+num_clusters <- 3
+
+kmeans_model_test <- kmeans(df_cluster_test, centers = num_clusters)
+
+df_cluster_test$cluster <- kmeans_model_test$cluster
+
+cluster_centers_test <- kmeans_model_test$centers
+distances_test <- sqrt(rowSums((df_cluster_test[, c("heart_rate", "duration")] - cluster_centers_test[df_cluster_test$cluster, ])^2))
+
+anomaly_scores_test <- distances_test
+
+threshold_test <- quantile(anomaly_scores_test, 0.60)
+
+df_anomalies_test <- df_cluster_test[anomaly_scores_test > threshold_test, ]
+df_cluster_test$anomaly_test <- anomaly_scores_test > threshold_test
+```
+
+```{r, echo=TRUE}
+# Visualization for second model
+ggplot(df_cluster_test, aes(x = heart_rate, y = duration, color = cluster, shape = anomaly_test)) +
+  geom_point() +
+  labs(title = "Anomalieerkennung in den Schlafphasen", 
+         x = "Herzrate", y = "Dauer der Schlafphasen")
+```
+
+### Ergebnis
+
+```{r, echo=TRUE}
+ggplot(df_anomalies_test, aes(x = heart_rate, y = duration, color = cluster)) +
+  geom_point() +
+  labs(title = "Anomalien in den Schlafphasen", subtitle = "Manuelles Clustering", 
+         x = "Herzrate", y = "Dauer der Schlafphasen")
+
+ggplot(df_anomalies, aes(x = heart_rate, y = duration, color = cluster)) +
+  geom_point() +
+  labs(title = "Anomalien in den Schlafphasen", subtitle = "Automatisches Clustering", 
+         x = "Herzrate", y = "Dauer der Schlafphasen")
+```
+
+Beim Vergleich der beiden Cluster ist ersichtlich, dass sich meine Theorie nicht bestätigt. Dies ist darauf zurückzuführen, dass wir in unserem Dataset zu wenige Variablen beziehungsweise Attribute haben um den Schlaf zu bewerten und sich die Werte der Herzrate zu ähnlich sind.
